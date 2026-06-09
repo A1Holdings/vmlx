@@ -116,14 +116,25 @@ It is purpose-built for this exact problem and is the closest match in the org:
 - **Supervisor/lead + parallel workers** with **git-worktree isolation** (Anthropic multi-agent research system; CAID paper; every 2026 parallel-coding orchestrator — Conductor, Vibe Kanban, Claude Squad, Bernstein).
 - **Deterministic control flow.** Given local-model planning unreliability, keep the *task graph, scheduling, and merge queue in plain code* (Bernstein/Temporal style); use the LLM only for decomposition + leaf reasoning. Add NeMo-style `parse_agent_response_max_retries`, schema-constrained decoding, and persist the plan to durable store (survives context truncation).
 - **Structured signaling only.** Manager↔worker communication is **structured JSON + git commits, never free-form chat** (CAID identifies free-form inter-agent dialog as the primary failure mode).
-- **Merge-queue serialization + cross-model diff review** before landing; inject per-worker `PORT`/service namespaces (worktrees alone leave port/DB collisions).
-- **DAG dependency scheduling** with human-approval gate on decomposition (`requireApproval: true`).
+- **Merge-queue serialization + cross-model diff review** before landing; inject per-worker `PORT`/service namespaces (worktrees alone leave port/DB collisions). The cross-model diff review is an **autonomous LLM reviewer**, not a human approval — it accepts/rejects/sends-back automatically.
+- **DAG dependency scheduling, fully autonomous.** Decomposition runs without a human-approval gate (`requireApproval: false` / removed). The validity bar is enforced by *automated* checks instead — schema-constrained decomposition output, the cross-model diff reviewer, and the `terminal-bench` quality gate — so the pipeline never blocks on a human.
+
+> **Autonomy principle (design constraint):** the system is **fully autonomous end to end** — no human-in-the-loop approval anywhere on the hot path (not on decomposition, not on egress, not on merges). All gates are *automated* policy/checks. A human can still inspect after the fact via the dashboard/audit log, but nothing waits for a person.
 
 ### 4.3 NVIDIA ideas to borrow (`A1Holdings/NemoClaw` + NeMo Agent Toolkit)
+*(adapted for full autonomy — we take the routing/blueprint/workflow patterns but drop the human-approval and telemetry pieces)*
 - **Routed `inference.local` gateway:** agents always talk to one fixed hostname; the gateway owns routing/credentials and maps it to the Mac MLX server. NemoClaw even validates the endpoint by probing `/responses`→`/chat/completions`→`/v1/messages` — exactly vMLX's APIs. **This is our inference gateway pattern.**
-- **Deny-by-default egress + per-binary network allowlists + real-time HITL approval** (e.g., only `git`/`gh` may reach `github.com`) — critical to keep "local-only" honest.
-- **Declarative, digest-verified "blueprint" lifecycle** (`plan → apply → status → rollback`) for reproducible, auditable agent infra.
-- **YAML config-driven workflows** with parse-retries; **OpenTelemetry tracing + systematic eval harness**; **latency-aware routing/priority/caching** for a single backend (Dynamo idea); **NeMo Guardrails** to validate planner/agent outputs on weaker local models. vMLX itself is our local **NIM-equivalent**.
+- **Egress: static, pre-declared allowlist enforced autonomously — NO human-in-the-loop approval.** Keep deny-by-default *only* as an automatic guardrail so a worker can't silently exfiltrate to the cloud (which would break the "local-only, no cloud fees" goal). Unlisted destinations are auto-denied (and logged), never escalated to a person. The operator sets the allowlist once in config (e.g., `github.com` for `git`/`gh`, package registries); at runtime there are zero prompts. *(If you'd rather not constrain egress at all, this whole guardrail can be disabled — it is not required for autonomy, only for the local-only privacy guarantee.)*
+- **Declarative, digest-verified "blueprint" lifecycle** (`plan → apply → status → rollback`) for reproducible, auditable agent infra — applied automatically, no approval step.
+- **YAML config-driven workflows** with parse-retries; **systematic eval harness** (`terminal-bench`); **latency-aware routing/priority/caching** for a single backend (Dynamo idea); **NeMo Guardrails** to validate planner/agent outputs on weaker local models. vMLX itself is our local **NIM-equivalent**. *(Skipped on purpose: OpenTelemetry/Phoenix distributed tracing — see §4.5.)*
+
+### 4.5 Observability without OpenTelemetry
+Per the autonomy/simplicity preference, **no OpenTelemetry tracing.** Use lightweight, local-only visibility instead:
+- **`agent-orchestrator`'s built-in SSE dashboard** (`:3000`) for live session/worker state.
+- **A local append-only event/audit log** (plain JSONL or SQLite) written by the orchestrator and gateway — task graph transitions, spawns, merges, tool calls, and rejections. This is enough to debug and replay runs.
+- **Per-worker harness logs** (`codex exec --json` JSONL / Claude Code `stream-json`) captured to disk per session.
+
+This keeps full after-the-fact visibility and replayability with zero external collectors, agents, or OTel infrastructure.
 
 ### 4.4 Supporting infrastructure to adopt from org forks
 | Concern | Adopt | Notes |
@@ -164,7 +175,7 @@ It is purpose-built for this exact problem and is the closest match in the org:
    │  Inference gateway  (inference.local)           │  ← NemoClaw routed pattern
    │  • global concurrency cap + priority queue      │  ← single-Mac bottleneck control
    │  • route by model name → N vMLX procs           │  ← replaces Electron api-gateway, headless
-   │  • deny-by-default egress + HITL approval        │  ← NemoClaw / OpenSandbox
+   │  • static egress allowlist (auto, NO human gate) │  ← optional local-only guardrail
    └───────────────┬───────────────────────────────┘
                    ▼
         ┌──────────────────────┐     Shared services:
@@ -176,17 +187,17 @@ It is purpose-built for this exact problem and is the closest match in the org:
         └──────────────────────┘
 ```
 
-**One-sentence pattern:** supervisor/lead + parallel git-worktree-isolated workers (Codex/Claude Code harnesses), driven by a deterministic orchestrator, all inference routed through one local gateway in front of concurrency-enabled vMLX, with local memory/tools/eval and deny-by-default egress.
+**One-sentence pattern:** a **fully autonomous** supervisor/lead + parallel git-worktree-isolated workers (Codex/Claude Code harnesses), driven by a deterministic orchestrator, all inference routed through one local gateway in front of concurrency-enabled vMLX, with local memory/tools/eval, an optional auto-enforced egress allowlist, and local-only audit logging (no human gates, no OpenTelemetry).
 
 ---
 
 ## 6. Build roadmap (phased, dependency-ordered — no calendar estimates)
 
 - **Phase 0 — De-risk the bottleneck (must come first).** Pin a known-good vMLX commit. Stand up vMLX with `--continuous-batching --max-num-seqs N`; **benchmark N=4/8/16** on Qwen3/Gemma/Llama to find the real throughput curve and unified-memory ceiling. Validate **Codex↔vMLX `/v1/responses`** end-to-end (tool items, reasoning items, `previous_response_id`) and **Claude Code↔vMLX `/v1/messages`**. *Exit criterion:* a documented concurrency/memory budget and two working harness↔vMLX paths.
-- **Phase 1 — Inference gateway.** Build the headless multi-model gateway (`inference.local`): route by model name to N vMLX processes, spawn/health/JIT-load, global concurrency cap + priority queue, per-agent rate limit, deny-by-default egress + HITL. Replaces the Electron `api-gateway` logic without the GUI.
-- **Phase 2 — Orchestrator core.** Fork-rebase `agent-orchestrator`; repoint `decomposer.ts` + `Agent.getEnvironment()` to the gateway; **replace LLM-driven control flow with a deterministic scheduler + merge queue + cross-model diff review**; keep AO's worktree/reaction/recovery/dashboard machinery. Enforce structured-JSON+git-commit signaling.
-- **Phase 3 — Memory + tools + isolation.** Layer `mem0`/`byterover` (working) + `mempalace` (long-term) + `qdrant`; expose `composio`/`crawl4ai`/`browser-use` via MCP behind egress policy; add Docker/OpenSandbox runtime tier.
-- **Phase 4 — Quality gate + observability.** Wire `terminal-bench`/harbor as the agent-quality CI gate; OpenTelemetry tracing across orchestrator/gateway/harnesses; NeMo-Guardrails-style output validation for weak local models.
+- **Phase 1 — Inference gateway.** Build the headless multi-model gateway (`inference.local`): route by model name to N vMLX processes, spawn/health/JIT-load, global concurrency cap + priority queue, per-agent rate limit, and an **optional static egress allowlist enforced automatically (no human approval)**. Replaces the Electron `api-gateway` logic without the GUI.
+- **Phase 2 — Orchestrator core.** Fork-rebase `agent-orchestrator`; repoint `decomposer.ts` + `Agent.getEnvironment()` to the gateway; **replace LLM-driven control flow with a deterministic scheduler + merge queue + autonomous cross-model diff review**; disable human-approval gates (`requireApproval: false`) for full autonomy; keep AO's worktree/reaction/recovery/dashboard machinery. Enforce structured-JSON+git-commit signaling.
+- **Phase 3 — Memory + tools + isolation.** Layer `mem0`/`byterover` (working) + `mempalace` (long-term) + `qdrant`; expose `composio`/`crawl4ai`/`browser-use` via MCP (gated by the auto egress allowlist if enabled); add Docker/OpenSandbox runtime tier.
+- **Phase 4 — Quality gate + local observability.** Wire `terminal-bench`/harbor as the autonomous agent-quality gate; **local-only audit logging (JSONL/SQLite) + the AO dashboard — no OpenTelemetry**; NeMo-Guardrails-style automated output validation for weak local models.
 - **Phase 5 (optional) — Latency pool + self-improvement.** Add the single-stream latency lane (vMLX spec / dflash-mlx) if benchmarks justify; introduce offline GEPA/DSPy (`hermes-agent-self-evolution`) skill/prompt optimization from session histories.
 
 ---
@@ -201,7 +212,8 @@ It is purpose-built for this exact problem and is the closest match in the org:
 | **vMLX maturity / release-lock** (`release_ready=false`) | Medium | Pin commit; standardize on vetted families; own acceptance suite; `vllm-mlx`/`vllm-metal` documented hedge. |
 | **No headless multi-model routing** (lives in Electron) | Medium | Phase 1 gateway (largest net-new build). |
 | **State/merge consistency across worktrees** | Medium | Git-as-truth; serialized merge queue + cross-model review; per-worker PORT/service namespaces; SQLite/Temporal event log for durability. |
-| **Privacy/egress leakage** (cloud tools/telemetry) | Medium | Deny-by-default egress + per-binary allowlists + HITL; force `*_BASE_URL` to gateway so no accidental cloud fallback. |
+| **Privacy/egress leakage** (cloud tools/telemetry) | Medium | Optional auto-enforced static egress allowlist (no human gate); force `*_BASE_URL` to gateway so no accidental cloud fallback. Guardrail is automatic, never blocks on a person. |
+| **Full autonomy without human gates → runaway/bad merges** | Medium | Automated gates replace human ones: schema-constrained outputs, autonomous cross-model diff review, `terminal-bench` quality gate, serialized merge queue, per-task budget caps, and AO `recovery/` self-healing; everything is replayable from the local audit log. |
 | **License/IP** | Medium | Build on Apache/MIT (vMLX, codex, agent-orchestrator). **Avoid shipping on leaked-source `openclaude`/`claude-code-*`** (no/unknown license); copyleft prompt corpora not vendored verbatim; real Claude Code = use-only under Anthropic ToS. |
 | **Fork staleness** (snapshot forks: orchestration ~2026-03-25, harness ~2026-04, dflash ~2026-04) | Low-Med | Rebase onto upstreams periodically; digest-verify before adopting. |
 | **Vision turns bypass KV cache** | Low-Med | Capacity-plan vision agents separately; reuse `vision_embedding_cache.py`. |
@@ -219,7 +231,7 @@ It is purpose-built for this exact problem and is the closest match in the org:
 
 ## 9. Final answer to the proposal
 
-**Yes — build on vMLX, but as the inference layer of a three-layer stack, not as the orchestrator itself.** Use **vMLX (concurrency-enabled, behind a new headless `inference.local` gateway)** for inference; **Codex (primary) + Claude Code (secondary)** as the per-agent harnesses pointed at vMLX; and **agent-orchestrator (made deterministic, worktree-isolated, structured-signaling)** as the orchestration brain. Keep **mlx-vlm** embedded for vision and **dflash-mlx** as an optional latency side-pool. Borrow NVIDIA's routed-gateway + deny-by-default egress + declarative-blueprint + eval/observability patterns. The dominant constraints are local-model reliability and single-Mac contention — both handled by keeping orchestration control flow deterministic and gating concurrency at the gateway.
+**Yes — build on vMLX, but as the inference layer of a three-layer stack, not as the orchestrator itself.** Use **vMLX (concurrency-enabled, behind a new headless `inference.local` gateway)** for inference; **Codex (primary) + Claude Code (secondary)** as the per-agent harnesses pointed at vMLX; and **agent-orchestrator (made deterministic, worktree-isolated, structured-signaling)** as the orchestration brain. Keep **mlx-vlm** embedded for vision and **dflash-mlx** as an optional latency side-pool. Borrow NVIDIA's routed-gateway + declarative-blueprint + eval patterns, but run **fully autonomously** — no human-in-the-loop approval anywhere (decomposition, egress, or merges all use *automated* gates), and **no OpenTelemetry** (local JSONL/SQLite audit log + the AO dashboard instead). An optional static egress allowlist is enforced automatically purely to preserve the local-only/no-cloud guarantee, and can be turned off entirely. The dominant constraints are local-model reliability and single-Mac contention — both handled by keeping orchestration control flow deterministic and gating concurrency at the gateway.
 
 ---
 
